@@ -76,6 +76,16 @@ public class ATSFileParser extends BaseParser implements ATSData {
     try {
       parseATSZipFile(atsZipFile);
 
+      // parseATSZipFile skips whitespace-only zip entries (see readJson) — if no entry
+      // carried the DAG payload, dagInfo is still null and addRawDataToDagInfo would NPE
+      // on BaseParser#addRawDataToDagInfo. Fail fast with a diagnostic naming the archive
+      // and the requested dagId so the caller sees a real TezException.
+      if (dagInfo == null) {
+        throw new TezException("No DAG entry found in ATS archive " + atsZipFile
+            + " for dagId=" + dagId + " (all entries were empty or missing the '"
+            + Constants.DAG + "' payload)");
+      }
+
       linkParsedContents();
       addRawDataToDagInfo();
 

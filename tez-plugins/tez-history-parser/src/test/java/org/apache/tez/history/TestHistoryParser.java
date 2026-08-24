@@ -28,6 +28,7 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
@@ -37,8 +38,10 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -252,7 +255,9 @@ public class TestHistoryParser {
       try {
         // Fresh download every attempt — ATSImportTool overwrites the zip.
         int result = ATSImportTool.process(args);
-        assertEquals(0, result);
+        if (result != 0) {
+          throw new IOException("ATS export failed with exit code: " + result);
+        }
         DagInfo info = getDagInfo(dagId);
         if (isDagInfoComplete(info, expectedNumOfVertices)) {
           return info;
@@ -290,9 +295,19 @@ public class TestHistoryParser {
                 && v.getTasks().stream().allMatch(t -> !t.getTaskAttempts().isEmpty()));
   }
 
+  /**
+   * SimpleHistoryLoggingService writes events asynchronously and only hflushes/closes the file
+   * when the AM shuts down (see SimpleHistoryLoggingService#serviceStop). Two equal-length size
+   * samples do not prove the writer has finished — it can pause between events while the file
+   * is still open. Poll for the terminal DAG record instead: a JSON object with
+   * {@code "eventType":"DAG_FINISHED"} that carries this DAG's entityId. That record is the
+   * last one {@link SimpleHistoryLoggingService} emits for the DAG, so its presence guarantees
+   * the snapshot the parser will read is complete.
+   */
   private void waitForHistoryFileReady(String dagId, long timeoutMs) throws Exception {
     TezDAGID tezDAGID = TezDAGID.fromString(dagId);
-    ApplicationAttemptId applicationAttemptId = ApplicationAttemptId.newInstance(tezDAGID.getApplicationId(), 1);
+    ApplicationAttemptId applicationAttemptId =
+        ApplicationAttemptId.newInstance(tezDAGID.getApplicationId(), 1);
     Path historyPath = new Path(conf.get("fs.defaultFS")
         + SIMPLE_HISTORY_DIR + HISTORY_TXT + "." + applicationAttemptId);
     FileSystem hfs = historyPath.getFileSystem(conf);
@@ -300,16 +315,30 @@ public class TestHistoryParser {
     long lastLen = -1L;
     while (System.nanoTime() < deadlineNanos) {
       if (hfs.exists(historyPath)) {
-        long len = hfs.getFileStatus(historyPath).getLen();
-        if (len > 0 && len == lastLen) {
+        lastLen = hfs.getFileStatus(historyPath).getLen();
+        if (lastLen > 0 && hasDagFinishedRecord(hfs, historyPath, dagId)) {
           return;
         }
-        lastLen = len;
       }
       Thread.sleep(500);
     }
     fail("Timed out waiting for SimpleHistory file " + historyPath
-        + " to be ready within " + timeoutMs + "ms (lastLen=" + lastLen + ")");
+        + " to contain DAG_FINISHED for " + dagId + " within " + timeoutMs + "ms (lastLen="
+        + lastLen + ")");
+  }
+
+  /**
+   * Return true if the history file contains a DAG_FINISHED record for the given dagId. The
+   * check reads the file's current bytes and searches for the two markers the JSON encoding
+   * always emits together (see HistoryEventJsonConversion#convertDAGFinishedEvent):
+   */
+  private static boolean hasDagFinishedRecord(FileSystem hfs, Path historyPath, String dagId)
+      throws IOException {
+    try (FSDataInputStream in = hfs.open(historyPath)) {
+      String contents = new String(IOUtils.toByteArray(in), StandardCharsets.UTF_8);
+      return contents.contains("\"entityId\":\"" + dagId + "\"")
+          && contents.contains("\"eventType\":\"DAG_FINISHED\"");
+    }
   }
 
   private DagInfo getDagInfoFromSimpleHistory(String dagId) throws TezException, IOException {

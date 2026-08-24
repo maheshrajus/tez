@@ -88,6 +88,20 @@ public class TestATSFileParser {
   }
 
   @Test
+  public void parserRejectsArchiveWithNoDagEntry(@TempDir Path tmp) throws Exception {
+    File zip = writeZip(tmp, "all-blank.zip",
+        new ZipContent("empty-part.json", ""),
+        new ZipContent("whitespace-part.json", "   \n\t  "));
+
+    ATSFileParser parser = new ATSFileParser(Collections.singletonList(zip));
+    TezException thrown = assertThrows(TezException.class, () -> parser.getDAGData(DAG_ID));
+    String msg = thrown.getMessage();
+    assertNotNull(msg);
+    assertTrue(msg.contains(DAG_ID), "Error should name the requested dagId, got: " + msg);
+    assertTrue(msg.contains("all-blank.zip"), "Error should name the archive, got: " + msg);
+  }
+
+  @Test
   public void parserReportsOffendingEntryOnMalformedJson(@TempDir Path tmp) throws Exception {
     // Simulates the timeline server returning an HTML error page instead of JSON.
     File zip = writeZip(tmp, "malformed.zip",
